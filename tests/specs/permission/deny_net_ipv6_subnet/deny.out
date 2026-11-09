@@ -1,0 +1,9 @@
+PASS: connect [fc00::1]:8000 denied
+PASS: connect [fdab::1]:8000 denied
+PASS: connect [fe80::1]:8000 denied
+PASS: connect [2001:db8::1]:8000 denied
+PASS: fetch http://[fc00::1]:8000/ denied
+PASS: fetch http://[fe80::1]:8000/ denied
+[2001:db8::1]:80 granted
+[2001:db9::1]:8000 granted
+[::1]:8000 granted

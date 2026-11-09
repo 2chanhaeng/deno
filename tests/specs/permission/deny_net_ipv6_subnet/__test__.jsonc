@@ -1,0 +1,17 @@
+{
+  "tests": {
+    "deny": {
+      "args": "run --allow-net --deny-net=fc00::/7,[fe80::]/10,[2001:db8::]/32:8000 deny.ts",
+      "output": "deny.out"
+    },
+    "allow": {
+      "args": "run --allow-net=[::1]/128,fd00::/8 allow.ts",
+      "output": "allow.out"
+    },
+    "port_without_brackets": {
+      "args": "run --deny-net=fc00::/7:8000 allow.ts",
+      "output": "port_without_brackets.out",
+      "exitCode": 1
+    }
+  }
+}

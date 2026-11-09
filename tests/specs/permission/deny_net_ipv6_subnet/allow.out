@@ -1,0 +1,4 @@
+[::1]:8000 granted
+[fd12:3456::1]:8000 granted
+[fc00::1]:8000 prompt
+[::2] prompt

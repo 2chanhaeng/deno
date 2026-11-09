@@ -1,0 +1,2 @@
+error: ipv6 addresses must be enclosed in square brackets: 'fc00::/7:8000'
+[WILDCARD]

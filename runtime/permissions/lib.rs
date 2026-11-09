@@ -25,6 +25,8 @@ use deno_terminal::colors;
 use deno_unsync::sync::AtomicFlag;
 use fqdn::FQDN;
 use ipnet::IpNet;
+use ipnet::Ipv4Net;
+use ipnet::Ipv6Net;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde::Deserialize;
@@ -1796,6 +1798,24 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
   }
 }
 
+/// Converts a range of IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d/96+n`) to
+/// the IPv4 range it maps (`a.b.c.d/n`).
+///
+/// Addresses are compared after `normalize_ip`, so an IPv4-mapped IPv6 range
+/// left as is would never contain a queried address, and a deny rule written
+/// that way would deny nothing.
+fn normalize_ip_net(net: IpNet) -> IpNet {
+  if let IpNet::V6(v6) = net
+    && let Some(v4) = v6.addr().to_ipv4_mapped()
+    && let Some(prefix_len) = v6.prefix_len().checked_sub(96)
+    && let Ok(v4_net) = Ipv4Net::new(v4, prefix_len)
+  {
+    IpNet::V4(v4_net)
+  } else {
+    net
+  }
+}
+
 #[derive(Clone, Eq, PartialEq, Hash, Debug, PartialOrd, Ord)]
 pub enum Host {
   Fqdn(FQDN),
@@ -1934,7 +1954,7 @@ impl Host {
       }
       Ok(Host::Ip(normalize_ip(ip)))
     } else if let Ok(ip_subnet) = s.parse::<IpNet>() {
-      Ok(Host::IpSubnet(ip_subnet))
+      Ok(Host::IpSubnet(normalize_ip_net(ip_subnet)))
     } else {
       let lower = if s.chars().all(|c| c.is_ascii_lowercase()) {
         Cow::Borrowed(s)
@@ -2109,6 +2129,11 @@ pub enum NetDescriptorParseError {
   InvalidIpv6 { hostname: String, ip: String },
   #[error("invalid port in '{hostname}': '{port}'")]
   InvalidPort { hostname: String, port: String },
+  #[error("invalid prefix length in '{hostname}': '{prefix_len}'")]
+  InvalidPrefixLen {
+    hostname: String,
+    prefix_len: String,
+  },
   #[error("invalid host: '{0}'")]
   InvalidHost(String),
   #[error("invalid empty port in '{0}'")]
@@ -2188,6 +2213,16 @@ impl NetDescriptor {
       ));
     }
 
+    // An IP range without a port (e.g. `fc00::/7`). This has to come before
+    // the host/port split below, which would cut an IPv6 range at its first
+    // colon.
+    if let Ok(ip_subnet) = hostname.parse::<IpNet>() {
+      return Ok(NetDescriptor(
+        Host::IpSubnet(normalize_ip_net(ip_subnet)),
+        None,
+      ));
+    }
+
     // If this is a IPv6 address enclosed in square brackets, parse it as such.
     if hostname.starts_with('[') {
       if let Some((ip, after)) = hostname.split_once(']') {
@@ -2199,6 +2234,22 @@ impl NetDescriptor {
               hostname: hostname.to_string(),
               ip: ip_str.to_string(),
             })?;
+        // A prefix length after the brackets makes this an IPv6 range
+        // (e.g. `[fc00::]/7` or `[fc00::]/7:443`).
+        let (ip_subnet, after) = match after.strip_prefix('/') {
+          Some(rest) => {
+            let (prefix_len, after) =
+              rest.find(':').map_or((rest, ""), |idx| rest.split_at(idx));
+            let ip_subnet = format!("{ip}/{prefix_len}")
+              .parse::<Ipv6Net>()
+              .map_err(|_| NetDescriptorParseError::InvalidPrefixLen {
+                hostname: hostname.to_string(),
+                prefix_len: prefix_len.to_string(),
+              })?;
+            (Some(ip_subnet), after)
+          }
+          None => (None, after),
+        };
         let port = if let Some(port) = after.strip_prefix(':') {
           let port = port.parse::<u16>().map_err(|_| {
             NetDescriptorParseError::InvalidPort {
@@ -2214,10 +2265,13 @@ impl NetDescriptor {
             hostname.to_string(),
           ));
         };
-        return Ok(NetDescriptor(
-          Host::Ip(normalize_ip(IpAddr::V6(ip))),
-          port.map(Into::into),
-        ));
+        let host = match ip_subnet {
+          Some(ip_subnet) => {
+            Host::IpSubnet(normalize_ip_net(IpNet::V6(ip_subnet)))
+          }
+          None => Host::Ip(normalize_ip(IpAddr::V6(ip))),
+        };
+        return Ok(NetDescriptor(host, port.map(Into::into)));
       } else {
         return Err(NetDescriptorParseError::InvalidHost(hostname.to_string()));
       }
@@ -2279,7 +2333,12 @@ impl fmt::Display for NetDescriptor {
     match &self.0 {
       Host::Fqdn(fqdn) => write!(f, "{fqdn}"),
       Host::FqdnWithSubdomainWildcard(fqdn) => write!(f, "*.{fqdn}"),
-      Host::IpSubnet(ip_subnet) => write!(f, "{ip_subnet}"),
+      Host::IpSubnet(IpNet::V4(ip_subnet)) => write!(f, "{ip_subnet}"),
+      // Brackets keep a port after the range unambiguous (`[fc00::]/7:443`),
+      // matching how IPv6 addresses are written.
+      Host::IpSubnet(IpNet::V6(ip_subnet)) => {
+        write!(f, "[{}]/{}", ip_subnet.addr(), ip_subnet.prefix_len())
+      }
       Host::Ip(IpAddr::V4(ip)) => write!(f, "{ip}"),
       Host::Ip(IpAddr::V6(ip)) => write!(f, "[{ip}]"),
       Host::Vsock(cid) => write!(f, "vsock:{cid}"),
@@ -6491,6 +6550,44 @@ mod tests {
   }
 
   #[test]
+  fn test_check_net_deny_resolved_ipv6_subnet() {
+    // A hostname that resolves into a denied IPv6 range (e.g. a unique local
+    // address) must be denied after resolution, as with IPv4 ranges.
+    for deny_rule in ["fc00::/7", "[fc00::]/7", "[fc00::]/7:8000"] {
+      let parser = TestPermissionDescriptorParser;
+      let perms = Permissions::from_options(
+        &parser,
+        &PermissionsOptions {
+          allow_net: Some(svec!["example.com"]),
+          deny_net: Some(vec![deny_rule.to_string()]),
+          prompt: false,
+          ..Default::default()
+        },
+      )
+      .unwrap();
+      let mut perms = PermissionsContainer::new(Arc::new(parser), perms);
+
+      assert!(perms.check_net(&("example.com", Some(8000)), "api").is_ok());
+      for ip in ["fc00::1", "fdab::1"] {
+        assert!(
+          perms
+            .check_net_resolved(&ip.parse().unwrap(), 8000, "api")
+            .is_err(),
+          "resolved [{ip}]:8000 should be denied by {deny_rule}"
+        );
+      }
+      for ip in ["2001:db8::1", "fe80::1", "::1", "192.168.1.1"] {
+        assert!(
+          perms
+            .check_net_resolved(&ip.parse().unwrap(), 8000, "api")
+            .is_ok(),
+          "resolved {ip}:8000 should not be denied by {deny_rule}"
+        );
+      }
+    }
+  }
+
+  #[test]
   fn test_check_net_url() {
     let parser = TestPermissionDescriptorParser;
     let perms = Permissions::from_options(
@@ -7796,8 +7893,13 @@ mod tests {
     let perms = Permissions::from_options(
       &parser,
       &PermissionsOptions {
-        allow_net: Some(svec!["10.0.0.0/24"]),
-        deny_net: Some(svec!["192.168.1.0/24", "172.16.0.0/12"]),
+        allow_net: Some(svec!["10.0.0.0/24", "2001:db8::/32"]),
+        deny_net: Some(svec![
+          "192.168.1.0/24",
+          "172.16.0.0/12",
+          "fc00::/7",
+          "[fe80::]/10"
+        ]),
         ..Default::default()
       },
     )
@@ -7807,10 +7909,18 @@ mod tests {
       ("10.0.0.1", true),
       ("192.168.1.1", false),
       ("172.16.0.1", false),
+      ("2001:db8::1", true),
+      ("fc00::1", false),
+      ("fdab::1", false),
+      ("fe80::1", false),
     ];
 
     for (host, is_ok) in cases {
-      assert_eq!(perms.check_net(&(host, None), "api").is_ok(), is_ok);
+      assert_eq!(
+        perms.check_net(&(host, None), "api").is_ok(),
+        is_ok,
+        "{host}"
+      );
     }
   }
 
@@ -8552,6 +8662,92 @@ mod tests {
         NetDescriptor::parse_for_list(input).ok(),
         *expected,
         "'{input}'"
+      );
+    }
+  }
+
+  #[test]
+  fn test_net_descriptor_parse_ip_subnet() {
+    let subnet = |s: &str| Host::IpSubnet(s.parse().unwrap());
+    let cases = [
+      (
+        "10.0.0.0/8",
+        Some(NetDescriptor(subnet("10.0.0.0/8"), None)),
+      ),
+      ("fc00::/7", Some(NetDescriptor(subnet("fc00::/7"), None))),
+      ("::1/128", Some(NetDescriptor(subnet("::1/128"), None))),
+      ("[fc00::]/7", Some(NetDescriptor(subnet("fc00::/7"), None))),
+      ("[::1]/128", Some(NetDescriptor(subnet("::1/128"), None))),
+      (
+        "[fc00::]/7:8000",
+        Some(NetDescriptor(subnet("fc00::/7"), Some(8000))),
+      ),
+      (
+        "[fe80::%eth0]/10",
+        Some(NetDescriptor(subnet("fe80::/10"), None)),
+      ),
+      // IPv4-mapped IPv6 ranges become the IPv4 range they map, as queried
+      // addresses are normalized to IPv4 before they are compared.
+      (
+        "::ffff:127.0.0.0/104",
+        Some(NetDescriptor(subnet("127.0.0.0/8"), None)),
+      ),
+      (
+        "[::ffff:127.0.0.0]/104:8000",
+        Some(NetDescriptor(subnet("127.0.0.0/8"), Some(8000))),
+      ),
+      ("::/0", Some(NetDescriptor(subnet("::/0"), None))),
+      // A port after a range needs brackets.
+      ("fc00::/7:8000", None),
+      ("fc00::/129", None),
+      ("[fc00::]/", None),
+      ("[fc00::]/a", None),
+      ("[fc00::]/+7", None),
+      ("[fc00::]/129", None),
+      ("[fc00::]/7:", None),
+      ("[fc00::]/7:a", None),
+      ("[fc00::]/7/8", None),
+      ("[127.0.0.1]/8", None),
+    ];
+
+    for (input, expected) in cases {
+      assert_eq!(
+        NetDescriptor::parse_for_query(input).ok(),
+        expected,
+        "parse_for_query '{input}'"
+      );
+      assert_eq!(
+        NetDescriptor::parse_for_list(input).ok(),
+        expected,
+        "parse_for_list '{input}'"
+      );
+    }
+
+    let err = NetDescriptor::parse_for_list("[fc00::]/129").unwrap_err();
+    assert!(
+      matches!(err, NetDescriptorParseError::InvalidPrefixLen { .. }),
+      "{err}"
+    );
+  }
+
+  #[test]
+  fn test_net_descriptor_ip_subnet_display() {
+    let cases = [
+      ("10.0.0.0/8", "10.0.0.0/8"),
+      ("10.0.0.0/8:8000", "10.0.0.0/8:8000"),
+      ("fc00::/7", "[fc00::]/7"),
+      ("[fc00::]/7:8000", "[fc00::]/7:8000"),
+      ("::ffff:127.0.0.0/104", "127.0.0.0/8"),
+    ];
+
+    for (input, expected) in cases {
+      let desc = NetDescriptor::parse_for_list(input).unwrap();
+      let displayed = desc.to_string();
+      assert_eq!(displayed, expected, "'{input}'");
+      assert_eq!(
+        NetDescriptor::parse_for_list(&displayed).unwrap(),
+        desc,
+        "'{input}' should survive a round-trip through '{displayed}'"
       );
     }
   }

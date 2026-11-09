@@ -213,6 +213,23 @@ mod tests {
   }
 
   #[test]
+  fn parse_net_args_ipv6_subnet() {
+    let entries =
+      svec!["fc00::/7", "::1/128", "[fe80::]/10", "[fc00::]/7:8000"];
+    let expected =
+      svec!["fc00::/7", "::1/128", "[fe80::]/10", "[fc00::]/7:8000"];
+    let actual = parse(entries).unwrap();
+    assert_eq!(actual, expected);
+  }
+
+  #[test]
+  fn parse_net_args_ipv6_subnet_error() {
+    assert!(parse(svec!["fc00::/7:8000"]).is_err());
+    assert!(parse(svec!["[fc00::]/129"]).is_err());
+    assert!(parse(svec!["[fc00::]/"]).is_err());
+  }
+
+  #[test]
   fn parse_net_args_ipv6_error1() {
     let entries = svec![":::"];
     assert!(parse(entries).is_err());
